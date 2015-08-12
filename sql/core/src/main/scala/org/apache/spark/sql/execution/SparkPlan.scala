@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.execution
 
+import java.util.concurrent.atomic.AtomicBoolean
+
 import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.Logging
@@ -30,6 +32,8 @@ import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.catalyst.plans.physical._
+import org.apache.spark.sql.execution.metric.{LongSQLMetric, SQLMetric, SQLMetrics}
+import org.apache.spark.sql.types.DataType
 
 object SparkPlan {
   protected[sql] val currentContext = new ThreadLocal[SQLContext]()
@@ -40,7 +44,6 @@ object SparkPlan {
  */
 @DeveloperApi
 abstract class SparkPlan extends QueryPlan[SparkPlan] with Logging with Serializable {
-  self: Product =>
 
   /**
    * A handle to the SQL Context that was used to create this plan.   Since many operators need
@@ -53,18 +56,40 @@ abstract class SparkPlan extends QueryPlan[SparkPlan] with Logging with Serializ
   protected def sparkContext = sqlContext.sparkContext
 
   // sqlContext will be null when we are being deserialized on the slaves.  In this instance
-  // the value of codegenEnabled will be set by the desserializer after the constructor has run.
+  // the value of codegenEnabled/unsafeEnabled will be set by the desserializer after the
+  // constructor has run.
   val codegenEnabled: Boolean = if (sqlContext != null) {
     sqlContext.conf.codegenEnabled
   } else {
     false
   }
+  val unsafeEnabled: Boolean = if (sqlContext != null) {
+    sqlContext.conf.unsafeEnabled
+  } else {
+    false
+  }
+
+  /**
+   * Whether the "prepare" method is called.
+   */
+  private val prepareCalled = new AtomicBoolean(false)
 
   /** Overridden make copy also propogates sqlContext to copied plan. */
-  override def makeCopy(newArgs: Array[AnyRef]): this.type = {
+  override def makeCopy(newArgs: Array[AnyRef]): SparkPlan = {
     SparkPlan.currentContext.set(sqlContext)
     super.makeCopy(newArgs)
   }
+
+  /**
+   * Return all metrics containing metrics of this SparkPlan.
+   */
+  private[sql] def metrics: Map[String, SQLMetric[_, _]] = Map.empty
+
+  /**
+   * Return a LongSQLMetric according to the name.
+   */
+  private[sql] def longMetric(name: String): LongSQLMetric =
+    metrics(name).asInstanceOf[LongSQLMetric]
 
   // TODO: Move to `DistributedPlan`
   /** Specifies how data is partitioned across different nodes in the cluster. */
@@ -80,16 +105,61 @@ abstract class SparkPlan extends QueryPlan[SparkPlan] with Logging with Serializ
   /** Specifies sort order for each partition requirements on the input data for this operator. */
   def requiredChildOrdering: Seq[Seq[SortOrder]] = Seq.fill(children.size)(Nil)
 
+  /** Specifies whether this operator outputs UnsafeRows */
+  def outputsUnsafeRows: Boolean = false
+
+  /** Specifies whether this operator is capable of processing UnsafeRows */
+  def canProcessUnsafeRows: Boolean = false
+
+  /**
+   * Specifies whether this operator is capable of processing Java-object-based Rows (i.e. rows
+   * that are not UnsafeRows).
+   */
+  def canProcessSafeRows: Boolean = true
+
   /**
    * Returns the result of this query as an RDD[InternalRow] by delegating to doExecute
    * after adding query plan information to created RDDs for visualization.
    * Concrete implementations of SparkPlan should override doExecute instead.
    */
   final def execute(): RDD[InternalRow] = {
+    if (children.nonEmpty) {
+      val hasUnsafeInputs = children.exists(_.outputsUnsafeRows)
+      val hasSafeInputs = children.exists(!_.outputsUnsafeRows)
+      assert(!(hasSafeInputs && hasUnsafeInputs),
+        "Child operators should output rows in the same format")
+      assert(canProcessSafeRows || canProcessUnsafeRows,
+        "Operator must be able to process at least one row format")
+      assert(!hasSafeInputs || canProcessSafeRows,
+        "Operator will receive safe rows as input but cannot process safe rows")
+      assert(!hasUnsafeInputs || canProcessUnsafeRows,
+        "Operator will receive unsafe rows as input but cannot process unsafe rows")
+    }
     RDDOperationScope.withScope(sparkContext, nodeName, false, true) {
+      prepare()
       doExecute()
     }
   }
+
+  /**
+   * Prepare a SparkPlan for execution. It's idempotent.
+   */
+  final def prepare(): Unit = {
+    if (prepareCalled.compareAndSet(false, true)) {
+      doPrepare()
+      children.foreach(_.prepare())
+    }
+  }
+
+  /**
+   * Overridden by concrete implementations of SparkPlan. It is guaranteed to run before any
+   * `execute` of SparkPlan. This is helpful if we want to set up some state before executing the
+   * query, e.g., `BroadcastHashJoin` uses it to broadcast asynchronously.
+   *
+   * Note: the prepare method has already walked down the tree, so the implementation doesn't need
+   * to call children's prepare methods.
+   */
+  protected def doPrepare(): Unit = {}
 
   /**
    * Overridden by concrete implementations of SparkPlan.
@@ -142,8 +212,7 @@ abstract class SparkPlan extends QueryPlan[SparkPlan] with Logging with Serializ
       val p = partsScanned until math.min(partsScanned + numPartsToTry, totalParts)
       val sc = sqlContext.sparkContext
       val res =
-        sc.runJob(childRDD, (it: Iterator[InternalRow]) => it.take(left).toArray, p,
-          allowLocal = false)
+        sc.runJob(childRDD, (it: Iterator[InternalRow]) => it.take(left).toArray, p)
 
       res.foreach(buf ++= _.take(n - buf.size))
       partsScanned += numPartsToTry
@@ -229,24 +298,29 @@ abstract class SparkPlan extends QueryPlan[SparkPlan] with Logging with Serializ
             throw e
           } else {
             log.error("Failed to generate ordering, fallback to interpreted", e)
-            new RowOrdering(order, inputSchema)
+            new InterpretedOrdering(order, inputSchema)
           }
       }
     } else {
-      new RowOrdering(order, inputSchema)
+      new InterpretedOrdering(order, inputSchema)
     }
+  }
+  /**
+   * Creates a row ordering for the given schema, in natural ascending order.
+   */
+  protected def newNaturalAscendingOrdering(dataTypes: Seq[DataType]): Ordering[InternalRow] = {
+    val order: Seq[SortOrder] = dataTypes.zipWithIndex.map {
+      case (dt, index) => new SortOrder(BoundReference(index, dt, nullable = true), Ascending)
+    }
+    newOrdering(order, Seq.empty)
   }
 }
 
 private[sql] trait LeafNode extends SparkPlan {
-  self: Product =>
-
   override def children: Seq[SparkPlan] = Nil
 }
 
 private[sql] trait UnaryNode extends SparkPlan {
-  self: Product =>
-
   def child: SparkPlan
 
   override def children: Seq[SparkPlan] = child :: Nil
@@ -255,8 +329,6 @@ private[sql] trait UnaryNode extends SparkPlan {
 }
 
 private[sql] trait BinaryNode extends SparkPlan {
-  self: Product =>
-
   def left: SparkPlan
   def right: SparkPlan
 
